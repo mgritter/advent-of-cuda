@@ -6,14 +6,14 @@
 
 typedef unsigned int uint32;
 
-__device__ uint32 
+inline __device__ uint32 
 leftRotate( uint32 x, uint32 c ) {
     return ( x << c ) | ( x >> (32 - c)); 
 }
 
 
 /* Assume trailer is 1 word only. */
-__device__ uint32
+inline __device__ uint32
 getMessageWord( int g, uint32 *nonzeroWords, int nonzeroLen, uint32 trailer ) {
     if ( g < nonzeroLen ) {
         return nonzeroWords[g];
@@ -30,7 +30,7 @@ getMessageWord( int g, uint32 *nonzeroWords, int nonzeroLen, uint32 trailer ) {
         uint32 dTemp = d;                                               \
         d = c;                                                          \
         c = b;                                                          \
-        b = b + leftRotate( a + f + K[i] + getMessageWord( g, nonzeroWords, numWords, originalLen ), shiftTable[i] ); \
+        b = b + leftRotate( a + f + task->K[i] + getMessageWord( g, nonzeroWords, numWords, originalLen ), task->shiftTable[i] ); \
         a = dTemp;                                                      \
     } while ( false )
  
@@ -39,24 +39,75 @@ countLeadingZeros( uint32 a ) {
     return __clz( __byte_perm( a, 0, 0x0123 ) );
 }
 
+struct MD5Task {
+    /* Fixed inputs */
+    const int *shiftTable;
+    const uint32 *K;
+
+    const char *fixedPortion;
+    int fixedLen;
+    uint32 goalMask;
+
+    /* Variable inputs */
+    int startN;
+    int batchSize;
+
+    /* Output */
+    int *goal;
+};
+
+
+__device__ bool md5Kernel_internal( struct MD5Task *task, uint32 n, int *localGoal );
+
 /**
  * Calculate MD5 of "fixedPortion", a numeric suffix, and zero-padding.
- * Check for at least numZeros 
+ * Check for at least numZeros.
  */
 __global__ void
-md5Kernel( int *shiftTable, uint32 *K, char *fixedPortion, int fixedLen, int goalMask, int startN, int *goal ) {
-    const uint32 a0 = 0x67452301;
-    const uint32 b0 = 0xefcdab89;
-    const uint32 c0 = 0x98badcfe;
-    const uint32 d0 = 0x10325476;
-    
-    uint32 i;
-
+md5Kernel( struct MD5Task task ) {
     /* The grid is a one-dimensional array of one-dimensional blocks. */
-    uint32 n = startN + blockDim.x * blockIdx.x + threadIdx.x;
+    uint32 startN = task.startN + blockDim.x * blockIdx.x + threadIdx.x;
+    uint32 stride = blockDim.x * gridDim.x; 
+    uint32 endN = startN + task.batchSize * stride;
 
+    int * globalGoal = task.goal;
+    __shared__ int localGoal;
+    __shared__ char localPrefix[16];
+    if ( threadIdx.x == 0 ) {
+        localGoal = *globalGoal;
+        /* FIXME: better to serialize this or distribute it? */
+        memcpy( localPrefix, task.fixedPortion, task.fixedLen );
+    }
+
+    __shared__ int localShiftTable[64];
+    __shared__ uint32 localKTable[64];
+    /* Assuming at least 64 threads per block */
+    if ( threadIdx.x < 64 ) {
+        localShiftTable[threadIdx.x] = task.shiftTable[threadIdx.x];
+        localKTable[threadIdx.x] = task.K[threadIdx.x];
+    }
+
+    /* Wait for shared memory to be filled before using it. */
+    __syncthreads();
+
+    task.shiftTable = localShiftTable;
+    task.K = localKTable;
+    task.fixedPortion = localPrefix;
+
+    /* Check for end of run locally first.
+       The thread that finds a solution also updates the global goal */
+    for ( int n = startN; 
+          n < endN && n < localGoal; 
+          n += stride ) {
+        md5Kernel_internal( &task, n, &localGoal );
+    }    
+}
+
+
+__device__ bool
+md5Kernel_internal( struct MD5Task *task, uint32 n, int *localGoal ) {
     /* Calculate log base 10 of n, and build a string that long */
-    char numeric[12];
+    char numeric[16];
     int pos = 11;
     int val = n;
     for ( ; pos >= 0; --pos ) {
@@ -66,20 +117,26 @@ md5Kernel( int *shiftTable, uint32 *K, char *fixedPortion, int fixedLen, int goa
     }
     /* pos was the last character written. */
     int numberLen = 12 - pos;
-    int numBytes = fixedLen + numberLen + 1;
+    int numBytes = task->fixedLen + numberLen + 1;
     int numWords = ( numBytes + 3 ) / 4; /* Round up to the nearest 32-bit word. */
     uint32 nonzeroWords[ 15 ];
     nonzeroWords[numWords-1] = 0; /* Ensure zero bits at the end */
 
     /* Arrange the nonzero portion of the 512-bit chunk */
     char * nonzeroBytes = (char *)nonzeroWords;
-    memcpy( nonzeroBytes, fixedPortion, fixedLen );
-    memcpy( nonzeroBytes + fixedLen, numeric + pos, numberLen );
-    nonzeroBytes[fixedLen + numberLen] = 0x80; /* 1 bit in MSB required */
+    memcpy( nonzeroBytes, task->fixedPortion, task->fixedLen );
+    memcpy( nonzeroBytes + task->fixedLen, numeric + pos, numberLen );
+    nonzeroBytes[task->fixedLen + numberLen] = 0x80; /* 1 bit in MSB required */
 
     int originalLen = ( numBytes - 1 ) * 8;
 
+    const uint32 a0 = 0x67452301;
+    const uint32 b0 = 0xefcdab89;
+    const uint32 c0 = 0x98badcfe;
+    const uint32 d0 = 0x10325476;
     uint32 a = a0, b = b0, c = c0, d = d0;
+
+    uint32 i;
     for ( i = 0; i <= 15; ++i ) {
         uint32 f = ( b & c ) | ( ~b & d );
         int g = i;
@@ -95,23 +152,28 @@ md5Kernel( int *shiftTable, uint32 *K, char *fixedPortion, int fixedLen, int goa
         int g = ( 3 * i + 5 ) & 0xf; /* mod 16 */
         SHIFT;
     }
+
     for ( i = 48; i <= 63; ++i ) {
         uint32 f= c ^ (b | ~d);
         int g = ( 7 * i ) & 0xf;
         SHIFT;
     }
-    
+
     a = a + a0;
-    
+
     /* Needed for debug only */
     /*
     b = b + b0;
     c = c + c0;
     d = d + d0;
     */
-    if ( ( a & goalMask ) == 0 ) {
-        atomicMin( goal, n ); 
-        printf( "Goal! %d => %08x %08x %08x %08x\n", n, a, b, c, d );
+    if ( ( a & task->goalMask ) == 0 ) {
+        printf( "Goal: %d => %08x\n", n, a );
+        *localGoal = n;
+        atomicMin( task->goal, n ); 
+        return true;
+    } else {
+        return false;
     }
 }
 
@@ -194,6 +256,8 @@ main( int argc, char *argv[] ) {
     int *output;
 
     size_t tableSize = 64 * sizeof( uint32 );
+
+    checkCudaErrors( cudaDeviceSetSharedMemConfig( cudaSharedMemBankSizeFourByte ) );
     
     checkCudaErrors( cudaMalloc( &deviceShiftTable, tableSize ) );
     checkCudaErrors( cudaMalloc( &deviceKTable, tableSize ) );
@@ -208,29 +272,38 @@ main( int argc, char *argv[] ) {
     /* My device has a maximum of 1024 threads per block and 
      * 2048 threads per multiprocessor.
      */
-    int blockSize = 512;
-    int numBlocks = 4;
-    int stride = blockSize * numBlocks;
-    int count = 100;
-    for ( int start = 0; start < maxSearch && goal == maxSearch; start += stride ) {
+    int blockSize = 128;
+    int numBlocks = 2048 / blockSize;
+    /* 1B iterations / 2048 threads = 489000 per thread 
+       Confusingly, large batch sizes make us slower.  */
+    int batchSize = 200;
+    int stride = blockSize * numBlocks * batchSize;
+
+    struct MD5Task t;
+    t.shiftTable = deviceShiftTable;
+    t.K = deviceKTable;
+    t.fixedPortion = deviceInput;
+    t.fixedLen = fixedLen;
+    t.goalMask = mask;
+    t.goal = output;
+    t.batchSize = batchSize;
+    /* Checking for success *really* slows down the loop.  So we just launch some kernels that
+     * might be unnecessary for small invocations.
+     * FIXME: do the copy in parallel?
+     */
+    for ( int start = 0; start < maxSearch; start += stride ) {
+        t.startN = start;
+        md5Kernel<<<numBlocks,blockSize>>>( t );
         checkCudaErrors( cudaGetLastError() );
-        md5Kernel<<<numBlocks,blockSize>>>( deviceShiftTable, deviceKTable, deviceInput, fixedLen, mask, start, output );
-        checkCudaErrors( cudaGetLastError() );
-        // slows us down by a factor of 2... not necessary when not using async?
-        // checkCudaErrors( cudaDeviceSynchronize() );
-        if ( count == 0 ) {
-            checkCudaErrors( cudaMemcpy( &goal, output, sizeof( int ), cudaMemcpyDeviceToHost ) );
-            count = 100;
-        } else {
-            --count;
-        }
     }
 
+    checkCudaErrors( cudaMemcpy( &goal, output, sizeof( int ), cudaMemcpyDeviceToHost ) ); 
     printf( "Answer: %d\n", goal );
 
     cudaFree( deviceShiftTable );
     cudaFree( deviceKTable );
     cudaFree( deviceInput );
+    cudaFree( output );
     
     cudaDeviceReset();
 

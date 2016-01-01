@@ -7,11 +7,13 @@ OS_ARCH = armv7l
 ARCH_FLAGS = -target-cpu-arch ARM
 GENCODE_FLAGS = -gencode arch=compute_32,code=sm_32
 LIBRARIES = -lcudart
+CFLAGS = -O2
+# CFLAGS = -g -G
 
 all: day4
 
 day4.o: day4.cu
-	$(NVCC) $(GENCODE_FLAGS) -o $@ -c $<
+	$(NVCC) $(CFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
 day4: day4.o
-	$(NVCC) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
+	$(NVCC) $(CFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
