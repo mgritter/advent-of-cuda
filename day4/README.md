@@ -1,5 +1,8 @@
 ## Timing results:
-  TODO
+
+Current version: NVIDIA Jetson TK1
+  * 6 zeros: ~0.5s
+  * 7 zeros: ~9s
   
 ## Comparisons
 
