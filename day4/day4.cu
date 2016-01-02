@@ -6,34 +6,6 @@
 
 typedef unsigned int uint32;
 
-inline __device__ uint32 
-leftRotate( uint32 x, uint32 c ) {
-    return ( x << c ) | ( x >> (32 - c)); 
-}
-
-
-/* Assume trailer is 1 word only. */
-inline __device__ uint32
-getMessageWord( int g, uint32 *nonzeroWords, int nonzeroLen, uint32 trailer ) {
-    if ( g < nonzeroLen ) {
-        return nonzeroWords[g];
-    } else if ( g == 14 ) {
-        /* Length is a 64-bit quantity stored LSB first */
-        return trailer;
-    } else {
-        return 0;
-    }
-}
-
-
-#define SHIFT do {                                                         \
-        uint32 dTemp = d;                                               \
-        d = c;                                                          \
-        c = b;                                                          \
-        b = b + leftRotate( a + f + task->K[i] + getMessageWord( g, nonzeroWords, numWords, originalLen ), task->shiftTable[i] ); \
-        a = dTemp;                                                      \
-    } while ( false )
- 
 inline __device__ int
 countLeadingZeros( uint32 a ) {
     return __clz( __byte_perm( a, 0, 0x0123 ) );
@@ -103,33 +75,145 @@ md5Kernel( struct MD5Task task ) {
     }    
 }
 
+// Sized for up to 10 digits + 1 byte for '1' bit + 9 fixed chars
+struct Header {
+    uint32 word[5];
+    uint32 originalLen;
+};
 
+/* logical left-shifting every digit produces, in little-endian:
+ *                 1     x    x   x
+ *                 10    1    x   x
+ *                 100   10   1   x
+ *                 1000  100  10  1
+ *                 10000 1000 100 10  1  x  x  x 
+ * 
+ * So we just have to get the word order right, i.e., 
+ * MSB of word N becomes LSB of word N+1
+ */
+
+inline __device__ struct Header
+shiftHeaderLeft( struct Header in ) {
+    struct Header out;
+    out.word[0] = ( in.word[0] << 8 );    
+    out.word[1] = ( in.word[0] >> 24 ) | ( in.word[1] << 8 );
+    out.word[2] = ( in.word[1] >> 24 ) | ( in.word[2] << 8 );
+    out.word[3] = ( in.word[2] >> 24 ) | ( in.word[3] << 8 );
+    out.word[4] = ( in.word[3] >> 24 ) | ( in.word[4] << 8 );
+    return out;
+}
+
+/* __byte_perm orders inputs from LSB to MSB of word A, then word B. 
+   Output is input[s[0:3]] ## input[s[4:7]] ## input[s[8:11]] ## input[s[12:15]] */
+
+
+__device__ struct Header
+constructHeaderWithShift( const char * fixedPortion, int fixedLen, int n ) {
+    /* fixedLen should be 0-3 */
+    struct Header number;
+    int digitLen = 0;
+
+    number.word[0] = 0x80; /* This is the mandatory 1 bit that will appear at the end */                                               
+    number.word[1] = 0;
+    number.word[2] = 0;
+    number.word[3] = 0;
+    number.word[4] = 0;
+
+    do {
+        number = shiftHeaderLeft( number );
+        number.word[0] |= ( '0' + ( n % 10 ) );
+        n /= 10;
+        digitLen += 1;
+    } while ( n > 0 );
+
+    for ( int k = 0; k < fixedLen; ++k ) {
+        /* One more shift for the fixed portion */
+        number = shiftHeaderLeft( number );
+    }
+    if ( fixedLen == 1 ) {
+        number.word[0] |= (uint32)( fixedPortion[0] );
+    } else if ( fixedLen == 2 ) {
+        number.word[0] |= (( *(uint32 *)( fixedPortion )) & 0xffff );
+    } else if ( fixedLen == 3 ) {
+        number.word[0] |= (( *(uint32 *)( fixedPortion )) & 0xffffff );
+    }
+
+    number.originalLen = ( digitLen + fixedLen ) * 8;
+    return number;
+}
+
+__device__ struct Header 
+constructHeader( struct MD5Task *task, int n ) {
+    /* Every element of the block has the same fixed length,
+       and most have the same # of digits in N as well. 
+       Not fully implemented at the moment. */
+    if ( task->fixedLen < 4 ) {
+        return constructHeaderWithShift( task->fixedPortion, task->fixedLen, n );
+    } else if ( task->fixedLen < 8 ) {
+        struct Header tail = constructHeaderWithShift( task->fixedPortion + 4, task->fixedLen - 4, n );
+        struct Header ret;
+        ret.word[0] = *(uint32 *)( task->fixedPortion );
+        ret.word[1] = tail.word[0];
+        ret.word[2] = tail.word[1];
+        ret.word[3] = tail.word[2];
+        ret.word[4] = tail.word[3];
+        ret.originalLen = tail.originalLen + 32; /* in bits, not bytes */
+        return ret;
+    } else {
+        struct Header tail = constructHeaderWithShift( task->fixedPortion + 8, task->fixedLen - 8, n );
+        struct Header ret;
+        ret.word[0] = *(uint32 *)( task->fixedPortion );
+        ret.word[1] = *(uint32 *)( task->fixedPortion + 4 );
+        ret.word[2] = tail.word[0];
+        ret.word[3] = tail.word[1];
+        ret.word[4] = tail.word[2];
+        ret.originalLen = tail.originalLen + 64; /* in bits, not bytes */
+        return ret;
+    }
+    /* FIXME: check for out-of-bounds behavior */
+}
+
+/* Assume trailer is 1 word only. */
+inline __device__ uint32
+getMessageWord( struct Header h, int i ) {
+    /* I'm hoping that not using [] will result in each word
+     * being assigned to a register, rather than using memory acccess.
+     */
+    if ( i == 0 ) {
+        return h.word[0];
+    } else if ( i == 1 ) {
+        return h.word[1];
+    } else if ( i == 2 ) {
+        return h.word[2];
+    } else if ( i == 3 ) {
+        return h.word[3];
+    } else if ( i == 4 ) {
+        return h.word[4];
+    } else if ( i == 14 ) {
+        /* Length is a 64-bit quantity stored LSB first */
+        return h.originalLen;
+    } else {
+        return 0;
+    }
+}
+
+inline __device__ uint32 
+leftRotate( uint32 x, uint32 c ) {
+    return ( x << c ) | ( x >> (32 - c)); 
+}
+
+#define SHIFT do {                                                         \
+        uint32 dTemp = d;                                               \
+        d = c;                                                          \
+        c = b;                                                          \
+        b = b + leftRotate( a + f + task->K[i] + getMessageWord( md5Header, g ), task->shiftTable[i] ); \
+        a = dTemp;                                                      \
+    } while ( false )
+ 
 __device__ bool
 md5Kernel_internal( struct MD5Task *task, uint32 n, int *localGoal ) {
-    /* Calculate log base 10 of n, and build a string that long */
-    char numeric[16];
-    int pos = 11;
-    int val = n;
-    for ( ; pos >= 0; --pos ) {
-        numeric[pos] = '0' + ( val % 10 );
-        val /= 10;
-        if ( val == 0 ) break;
-    }
-    /* pos was the last character written. */
-    int numberLen = 12 - pos;
-    int numBytes = task->fixedLen + numberLen + 1;
-    int numWords = ( numBytes + 3 ) / 4; /* Round up to the nearest 32-bit word. */
-    uint32 nonzeroWords[ 15 ];
-    nonzeroWords[numWords-1] = 0; /* Ensure zero bits at the end */
-
-    /* Arrange the nonzero portion of the 512-bit chunk */
-    char * nonzeroBytes = (char *)nonzeroWords;
-    memcpy( nonzeroBytes, task->fixedPortion, task->fixedLen );
-    memcpy( nonzeroBytes + task->fixedLen, numeric + pos, numberLen );
-    nonzeroBytes[task->fixedLen + numberLen] = 0x80; /* 1 bit in MSB required */
-
-    int originalLen = ( numBytes - 1 ) * 8;
-
+    struct Header md5Header = constructHeader( task, n );
+ 
     const uint32 a0 = 0x67452301;
     const uint32 b0 = 0xefcdab89;
     const uint32 c0 = 0x98badcfe;
@@ -246,6 +330,7 @@ main( int argc, char *argv[] ) {
         }
     }
 
+    //int maxSearch = 100;
     int maxSearch = 1000000000;
     int goal = maxSearch;
 
@@ -261,7 +346,7 @@ main( int argc, char *argv[] ) {
     
     checkCudaErrors( cudaMalloc( &deviceShiftTable, tableSize ) );
     checkCudaErrors( cudaMalloc( &deviceKTable, tableSize ) );
-    checkCudaErrors( cudaMalloc( &deviceInput, fixedLen ) );
+    checkCudaErrors( cudaMalloc( &deviceInput, fixedLen + 16 ) ); /* Allocate extra space */
     checkCudaErrors( cudaMalloc( &output, sizeof( int ) ) );
 
     checkCudaErrors( cudaMemcpy( deviceShiftTable, hostShiftTable, tableSize, cudaMemcpyHostToDevice ) );

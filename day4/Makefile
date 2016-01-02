@@ -8,9 +8,13 @@ ARCH_FLAGS = -target-cpu-arch ARM
 GENCODE_FLAGS = -gencode arch=compute_32,code=sm_32
 LIBRARIES = -lcudart
 CFLAGS = -O2
-# CFLAGS = -g -G
+#CFLAGS = -g -G
 
 all: day4
+
+clean:
+	rm day4
+	rm day4.o
 
 day4.o: day4.cu
 	$(NVCC) $(CFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
