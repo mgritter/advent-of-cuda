@@ -1,3 +1,5 @@
+CUDA implementation of this toy problem based on MD5 hashing: http://adventofcode.com/day/4
+
 ## Timing results:
 
 Run on a NVIDIA Jetson TK1.
